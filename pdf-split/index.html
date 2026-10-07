@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PDF A4分割</title>
+  <style>
+    :root { --fg:#1f2328; --muted:#656d76; --bg:#fff; --card:#f6f8fa; --line:#d0d7de; --accent:#0969da; }
+    @media (prefers-color-scheme: dark) {
+      :root { --fg:#e6edf3; --muted:#8d96a0; --bg:#0d1117; --card:#161b22; --line:#30363d; --accent:#4493f8; }
+    }
+    * { box-sizing: border-box; }
+    body { margin:0; background:var(--bg); color:var(--fg); font-family: system-ui, -apple-system, "Hiragino Sans", "Noto Sans JP", sans-serif; line-height:1.6; }
+    main { max-width:760px; margin:0 auto; padding:24px 16px 48px; }
+    h1 { font-size:1.5rem; margin:0 0 4px; }
+    p.lead { color:var(--muted); margin:0 0 24px; }
+    #drop { display:block; margin:0; border:2px dashed var(--line); border-radius:12px; padding:32px 16px; text-align:center; cursor:pointer; background:var(--card); }
+    #drop.over { border-color:var(--accent); }
+    #drop input { display:none; }
+    fieldset { border:1px solid var(--line); border-radius:8px; margin:16px 0; padding:12px 16px; }
+    legend { padding:0 4px; font-weight:600; }
+    label { margin-right:16px; display:inline-block; }
+    table { width:100%; border-collapse:collapse; margin:8px 0; font-size:.95rem; }
+    th, td { border-bottom:1px solid var(--line); padding:6px 8px; text-align:left; }
+    select { font:inherit; }
+    button { font:inherit; font-weight:600; padding:10px 24px; border:0; border-radius:8px; background:var(--accent); color:#fff; cursor:pointer; }
+    button:disabled { opacity:.5; cursor:default; }
+    #status { margin-left:12px; color:var(--muted); }
+    .note { color:var(--muted); font-size:.9rem; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>PDF A4分割</h1>
+  <p class="lead">A3やA4を3枚つなげた横長のPDFを、A4のページに分けます。ファイルはブラウザの中だけで処理され、外部には送信されません。</p>
+
+  <label id="drop">
+    <input type="file" id="file" accept="application/pdf,.pdf">
+    <strong>ここにPDFをドロップ</strong><br>またはクリックしてファイルを選択
+  </label>
+
+  <div id="settings" hidden>
+    <fieldset>
+      <legend>分割数</legend>
+      <label><input type="radio" name="mode" value="auto" checked> 自動（用紙サイズから判定）</label>
+      <label><input type="radio" name="mode" value="2"> すべて2分割</label>
+      <label><input type="radio" name="mode" value="3"> すべて3分割</label>
+      <label><input type="radio" name="mode" value="custom"> ページごとに指定</label>
+      <table id="pages"><thead><tr><th>ページ</th><th>サイズ</th><th>分割数</th></tr></thead><tbody></tbody></table>
+    </fieldset>
+    <fieldset>
+      <legend>オプション</legend>
+      <label><input type="checkbox" id="rtl"> 右側から順に並べる（縦書きの資料など）</label><br>
+      <label><input type="checkbox" id="fit" checked> A4サイズ（210×297mm）にそろえる</label>
+      <p class="note">チェックを外すと、拡大縮小せずに切り分けるだけになります。<br>縦長のページ（縦向きのA3など）は上下に分割します。</p>
+    </fieldset>
+    <button id="run">変換してダウンロード</button><span id="status"></span>
+  </div>
+</main>
+
+<script src="pdf-lib.min.js"></script>
+<script src="split.js"></script>
+<script>
+(function () {
+  const fileInput = document.getElementById('file');
+  const drop = document.getElementById('drop');
+  const settings = document.getElementById('settings');
+  const tbody = document.querySelector('#pages tbody');
+  const runBtn = document.getElementById('run');
+  const status = document.getElementById('status');
+  let current = null; // { name, bytes, pages }
+
+  function mode() { return document.querySelector('input[name=mode]:checked').value; }
+
+  function renderTable() {
+    const m = mode();
+    tbody.innerHTML = '';
+    current.pages.forEach((p, i) => {
+      const tr = document.createElement('tr');
+      const n = m === 'auto' || m === 'custom' ? p.auto : Number(m);
+      const sel = [1, 2, 3].map(v => `<option value="${v}"${v === (p.custom || n) ? ' selected' : ''}>${v}</option>`).join('');
+      tr.innerHTML = `<td>${i + 1}</td><td>${p.widthMm}×${p.heightMm}mm</td>` +
+        (m === 'custom' ? `<td><select data-i="${i}">${sel}</select></td>` : `<td>${n}</td>`);
+      tbody.appendChild(tr);
+    });
+  }
+
+  tbody.addEventListener('change', e => {
+    if (e.target.dataset.i) current.pages[e.target.dataset.i].custom = Number(e.target.value);
+  });
+  document.querySelectorAll('input[name=mode]').forEach(r => r.addEventListener('change', renderTable));
+
+  async function load(file) {
+    if (!file) return;
+    status.textContent = '';
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const pages = await PdfSplit.inspect(bytes);
+      current = { name: file.name.replace(/\.pdf$/i, ''), bytes, pages };
+      drop.querySelector('strong').textContent = file.name;
+      settings.hidden = false;
+      renderTable();
+    } catch (err) {
+      alert('PDFを読み込めませんでした: ' + err.message);
+    }
+  }
+
+  fileInput.addEventListener('change', () => load(fileInput.files[0]));
+  drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
+  drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+  drop.addEventListener('drop', e => {
+    e.preventDefault();
+    drop.classList.remove('over');
+    load(e.dataTransfer.files[0]);
+  });
+
+  runBtn.addEventListener('click', async () => {
+    const m = mode();
+    const splits = current.pages.map(p =>
+      m === 'auto' ? p.auto : m === 'custom' ? (p.custom || p.auto) : Number(m));
+    runBtn.disabled = true;
+    status.textContent = '変換中…';
+    try {
+      const out = await PdfSplit.splitPdf(current.bytes, {
+        splits,
+        rightToLeft: document.getElementById('rtl').checked,
+        fitA4: document.getElementById('fit').checked,
+      });
+      const url = URL.createObjectURL(new Blob([out], { type: 'application/pdf' }));
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = current.name + '_A4.pdf';
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+      status.textContent = `完了（${splits.reduce((a, b) => a + b, 0)}ページ）`;
+    } catch (err) {
+      status.textContent = '';
+      alert('変換に失敗しました: ' + err.message);
+    } finally {
+      runBtn.disabled = false;
+    }
+  });
+})();
+</script>
+</body>
+</html>

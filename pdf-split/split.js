@@ -1,0 +1,158 @@
+// A3・A4横3枚分などの横長PDFページを、A4ページに分割するロジック。
+// ブラウザでは window.PdfSplit、Node では module.exports として使える。
+(function (root, factory) {
+  if (typeof module === 'object' && module.exports) {
+    module.exports = factory(require('pdf-lib'));
+  } else {
+    root.PdfSplit = factory(root.PDFLib);
+  }
+})(typeof self !== 'undefined' ? self : this, function (PDFLib) {
+  'use strict';
+
+  const { PDFDocument, degrees } = PDFLib;
+  const MM = 72 / 25.4;
+  const A4_SHORT = 210 * MM;
+  const A4_LONG = 297 * MM;
+
+  function normRotation(page) {
+    return (((page.getRotation().angle % 360) + 360) % 360);
+  }
+
+  // 見た目上（回転を反映した）の幅と高さ
+  function visualSize(page) {
+    const box = page.getCropBox();
+    const r = normRotation(page);
+    return r === 90 || r === 270
+      ? { width: box.height, height: box.width }
+      : { width: box.width, height: box.height };
+  }
+
+  // 面積がA4何枚分かで分割数（1〜3）を決める。A3とA4は縦横比が同じなので、
+  // 比率ではなく実寸で判定する。長辺方向に分割する（横長なら左右、縦長なら上下）。
+  function detectSplit(page) {
+    const { width, height } = visualSize(page);
+    const n = Math.round((width * height) / (A4_SHORT * A4_LONG));
+    return Math.min(3, Math.max(1, n));
+  }
+
+  // 見た目上の位置 i 番目の区画を、ページの（回転前の）座標系での矩形に変換する。
+  // vertical=false: 左右に分割（左から i 番目）、true: 上下に分割（上から i 番目）
+  function sliceRect(page, n, i, vertical) {
+    const b = page.getCropBox();
+    const r = normRotation(page);
+    // 見た目の「左→右」または「上→下」が、元の座標系でどの軸のどの向きかを求める
+    //   r=0:   左→右 = x増加,  上→下 = y減少
+    //   r=90:  左→右 = y増加,  上→下 = x増加
+    //   r=180: 左→右 = x減少,  上→下 = y増加
+    //   r=270: 左→右 = y減少,  上→下 = x減少
+    let axis, increasing;
+    if (!vertical) {
+      axis = r === 0 || r === 180 ? 'x' : 'y';
+      increasing = r === 0 || r === 90;
+    } else {
+      axis = r === 0 || r === 180 ? 'y' : 'x';
+      increasing = r === 90 || r === 180;
+    }
+    const len = axis === 'x' ? b.width : b.height;
+    const step = len / n;
+    const start = increasing ? i * step : len - (i + 1) * step;
+    return axis === 'x'
+      ? { x: b.x + start, y: b.y, width: step, height: b.height }
+      : { x: b.x, y: b.y + start, width: b.width, height: step };
+  }
+
+  function sliceOrder(n, rightToLeft, vertical) {
+    const idx = [...Array(n).keys()];
+    return rightToLeft && !vertical ? idx.reverse() : idx;
+  }
+
+  /**
+   * @param {ArrayBuffer|Uint8Array} bytes 入力PDF
+   * @param {object} opts
+   *   splits: ページごとの分割数の配列（省略時は自動判定）
+   *   rightToLeft: 右側から順に並べる（縦書き資料など）
+   *   fitA4: true ならA4用紙サイズに拡大縮小して配置、false なら切り取りのみ
+   * @returns {Promise<Uint8Array>}
+   */
+  async function splitPdf(bytes, opts = {}) {
+    const src = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    const out = await PDFDocument.create();
+    const pages = src.getPages();
+    const fitA4 = opts.fitA4 !== false;
+
+    for (let p = 0; p < pages.length; p++) {
+      const page = pages[p];
+      const n = (opts.splits && opts.splits[p]) || detectSplit(page);
+      const vs = visualSize(page);
+      const vertical = vs.height > vs.width;
+      const order = sliceOrder(n, !!opts.rightToLeft, vertical);
+
+      if (!fitA4) {
+        const copies = await out.copyPages(src, Array(n).fill(p));
+        order.forEach((i, k) => {
+          const rect = sliceRect(page, n, i, vertical);
+          const pg = copies[k];
+          pg.setMediaBox(rect.x, rect.y, rect.width, rect.height);
+          pg.setCropBox(rect.x, rect.y, rect.width, rect.height);
+          pg.setBleedBox(rect.x, rect.y, rect.width, rect.height);
+          pg.setTrimBox(rect.x, rect.y, rect.width, rect.height);
+          pg.setArtBox(rect.x, rect.y, rect.width, rect.height);
+          out.addPage(pg);
+        });
+        continue;
+      }
+
+      const r = normRotation(page);
+      for (const i of order) {
+        const rect = sliceRect(page, n, i, vertical);
+        const emb = await out.embedPage(page, {
+          left: rect.x,
+          bottom: rect.y,
+          right: rect.x + rect.width,
+          top: rect.y + rect.height,
+        });
+        const sideways = r === 90 || r === 270;
+        const vw = sideways ? rect.height : rect.width;
+        const vh = sideways ? rect.width : rect.height;
+        const [pw, ph] = vw > vh ? [A4_LONG, A4_SHORT] : [A4_SHORT, A4_LONG];
+        const s = Math.min(pw / vw, ph / vh);
+        const w = vw * s;
+        const h = vh * s;
+        const ox = (pw - w) / 2;
+        const oy = (ph - h) / 2;
+        // ページの /Rotate（時計回り）を描画時の回転で再現する
+        const pos = {
+          0: [ox, oy],
+          90: [ox, oy + h],
+          180: [ox + w, oy + h],
+          270: [ox + w, oy],
+        }[r];
+        const newPage = out.addPage([pw, ph]);
+        newPage.drawPage(emb, {
+          x: pos[0],
+          y: pos[1],
+          xScale: s,
+          yScale: s,
+          rotate: degrees(-r),
+        });
+      }
+    }
+    return out.save();
+  }
+
+  function describePage(page) {
+    const { width, height } = visualSize(page);
+    return {
+      widthMm: Math.round(width / MM),
+      heightMm: Math.round(height / MM),
+      auto: detectSplit(page),
+    };
+  }
+
+  async function inspect(bytes) {
+    const src = await PDFDocument.load(bytes, { ignoreEncryption: true });
+    return src.getPages().map(describePage);
+  }
+
+  return { splitPdf, inspect, detectSplit };
+});
