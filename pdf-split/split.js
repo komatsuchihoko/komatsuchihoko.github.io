@@ -27,12 +27,42 @@
       : { width: box.width, height: box.height };
   }
 
-  // 面積がA4何枚分かで分割数（1〜3）を決める。A3とA4は縦横比が同じなので、
-  // 比率ではなく実寸で判定する。長辺方向に分割する（横長なら左右、縦長なら上下）。
-  function detectSplit(page) {
+  // 分割数を判定する。まず縦横比で「A3型（√2）」か「A4×3枚型」かを見分け、
+  // 縦横比が同じA3とA4だけは実寸で見分ける。スキャンなどで実寸がずれていても、
+  // 縦横比が崩れていなければ正しく判定できる。
+  //   A3横（420×297）      比 1.41 → 2分割（A4縦×2）
+  //   A4縦×3（630×297）    比 2.12 → 3分割（A4縦×3）
+  //   A4横×3（891×210）    比 4.24 → 3分割（A4横×3）
+  //   A4（297×210）        比 1.41 → 1（そのまま）
+  function classify(page) {
     const { width, height } = visualSize(page);
-    const n = Math.round((width * height) / (A4_SHORT * A4_LONG));
-    return Math.min(3, Math.max(1, n));
+    const long = Math.max(width, height);
+    const short = Math.min(width, height);
+    // 分割後の1枚の縦横比がA4（√2）からどれだけ離れているか
+    const err = n => {
+      const a = long / n;
+      return Math.abs(Math.abs(Math.log(a / short)) - Math.log(Math.SQRT2));
+    };
+    const e1 = err(1);  // 1枚・2枚分割は縦横比が同じなので誤差も同じ
+    const e3 = err(3);
+    let n, kind;
+    if (e3 < e1) {
+      n = 3;
+      kind = long / short > 3.2 ? 'A4横×3枚分' : 'A4縦×3枚分';
+    } else if (long >= 360 * MM) {
+      n = 2;
+      kind = 'A3';
+    } else {
+      n = 1;
+      kind = 'A4';
+    }
+    // 縦横比がどの型からも離れている（約8%以上）ときは要確認とする
+    const unsure = Math.min(e1, e3) > 0.08;
+    return { n, kind, unsure };
+  }
+
+  function detectSplit(page) {
+    return classify(page).n;
   }
 
   // 見た目上の位置 i 番目の区画を、ページの（回転前の）座標系での矩形に変換する。
@@ -103,8 +133,16 @@
       }
 
       const r = normRotation(page);
+      // 中身のない白紙ページは埋め込めないので、白紙のA4をそのまま作る
+      const blank = !page.node.Contents();
       for (const i of order) {
         const rect = sliceRect(page, n, i, vertical);
+        if (blank) {
+          const sideways = r === 90 || r === 270;
+          const landscape = (sideways ? rect.height : rect.width) > (sideways ? rect.width : rect.height);
+          out.addPage(landscape ? [A4_LONG, A4_SHORT] : [A4_SHORT, A4_LONG]);
+          continue;
+        }
         const emb = await out.embedPage(page, {
           left: rect.x,
           bottom: rect.y,
@@ -142,10 +180,13 @@
 
   function describePage(page) {
     const { width, height } = visualSize(page);
+    const c = classify(page);
     return {
       widthMm: Math.round(width / MM),
       heightMm: Math.round(height / MM),
-      auto: detectSplit(page),
+      auto: c.n,
+      kind: c.kind,
+      unsure: c.unsure,
     };
   }
 
